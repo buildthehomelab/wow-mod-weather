@@ -1,0 +1,78 @@
+[worldserver]
+
+########################################
+# mod-weather
+#
+# Weather for the zones AzerothCore leaves clear, light weather the client actually draws, and
+# fog, thunderstorms, black rain and black snow in the zones listed in `mod_weather_zone`.
+#
+# The core settings still apply: ActivateWeather turns all weather on or off, and
+# ChangeWeatherInterval (worldserver.conf, default 10 minutes) is how often each zone's weather
+# can change.
+########################################
+
+#
+#    Weather.Enable
+#        Description: Apply the module's rules. Off, zones still use the module's `game_weather`
+#                     rows (that's plain SQL), but weather behaves like stock AzerothCore, and any
+#                     fog or black snow clears at the zone's next weather change.
+#        Default:     1
+#
+
+Weather.Enable = 1
+
+#
+#    Weather.ShowLightWeather
+#        Description: Show the light weather the core rolls. Stock AzerothCore sends most light
+#                     rain, snow and sandstorms to the client as clear skies, so a zone can be
+#                     "raining" for a long time with nothing on screen. On, that weather is drawn
+#                     as light, so weather shows up about as often as the `game_weather` chances
+#                     say.
+#        Default:     1
+#
+
+Weather.ShowLightWeather = 1
+
+#
+#    Weather.Fog
+#        Description: Roll fog under clear skies in zones with a `fog_chance`. Only works on
+#                     continents, not inside instances.
+#        Default:     1
+#
+
+Weather.Fog = 1
+
+#
+#    Weather.FogInterval
+#        Description: How often, in seconds, a clear zone rolls its `fog_chance`. The fog (or
+#                     clear sky) lasts until the next roll or the next weather change.
+#                     Minimum 60.
+#        Default:     600
+#
+
+Weather.FogInterval = 600
+
+#
+#    Weather.Thunderstorms
+#        Description: Let heavy rain become a thunderstorm in zones with a `thunder_chance`.
+#        Default:     1
+#
+
+Weather.Thunderstorms = 1
+
+#
+#    Weather.BlackRain
+#        Description: Rain falls as black rain in zones with `black_rain` set.
+#        Default:     1
+#
+
+Weather.BlackRain = 1
+
+#
+#    Weather.BlackSnow
+#        Description: Snow falls as black snow in zones with `black_snow` set. Only works on
+#                     continents, not inside instances.
+#        Default:     1
+#
+
+Weather.BlackSnow = 1
