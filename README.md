@@ -42,6 +42,13 @@ The rules live in the world table `mod_weather_zone`: `fog_chance`, `thunder_cha
 without a restart. New `game_weather` rows need a restart, because the core only loads that
 table at startup.
 
+## Requirements
+
+- An [AzerothCore](https://github.com/azerothcore/azerothcore-wotlk) WotLK (master) server. The
+  module has no other module or core-fork dependencies.
+- `ActivateWeather = 1` in `worldserver.conf` (the default).
+- A WoW 3.3.5a (12340) client. No client patch or addon is needed.
+
 ## Install
 
 ```bash
@@ -88,3 +95,23 @@ thunderstorm below grade 0.7 turns back into rain.
   that point can still be there for the next player to arrive, until the zone's weather next
   changes.
 - Weather is visual only. Nothing in the game changes because of it.
+
+## Troubleshooting
+
+- **No new weather and the worldserver logs that `game_weather` has no row for Borean Tundra**:
+  the module's SQL in `data/sql/db-world/updates` wasn't applied. Apply it, or let the
+  worldserver's updater do it.
+- **The module builds but nothing changes**: the folder isn't named `mod-weather`, so
+  AzerothCore never calls the loader. Clone into `mod-weather` exactly.
+- **Edits to `mod_weather_zone` don't show**: run `.weather reload`. New `game_weather` rows
+  need a worldserver restart.
+- **Fog or black snow never appears in a dungeon or battleground**: expected. Those need a
+  continent, so instance zones only get thunderstorms and black rain.
+
+## Credits
+
+Author: [buildthehomelab](https://github.com/buildthehomelab)
+
+## License
+
+MIT, see [LICENSE](LICENSE).
