@@ -3,35 +3,78 @@
 ########################################
 # mod-weather
 #
-# Weather for the zones AzerothCore leaves clear, light weather the client actually draws, and
-# fog, thunderstorms, black rain and black snow in the zones listed in `mod_weather_zone`.
+# Weather that comes in fronts: neighbouring zones share a front, which builds up, peaks, tapers
+# off and is followed by a dry spell. Each zone turns the front into its own climate (rain, snow
+# or sandstorm). On top: fog, mist after rain, thunderstorms, black rain and black snow in the
+# zones listed in `mod_weather_zone`. Regions and city strength are in `mod_weather_region`.
 #
-# The core settings still apply: ActivateWeather turns all weather on or off, and
-# ChangeWeatherInterval (worldserver.conf, default 10 minutes) is how often each zone's weather
-# can change.
+# While the module runs it takes the weather over from the core: it sets ChangeWeatherInterval
+# so long that the core stops rolling (Isle of Quel'Danas still rolls on the original interval,
+# because the Sunwell event drives it). ActivateWeather still turns all weather off.
 ########################################
 
 #
 #    Weather.Enable
-#        Description: Apply the module's rules. Off, zones still use the module's `game_weather`
-#                     rows (that's plain SQL), but weather behaves like stock AzerothCore, and any
-#                     fog or black snow clears at the zone's next weather change.
+#        Description: Run the weather as fronts. Off, weather is stock AzerothCore (zones still
+#                     use the module's `game_weather` rows, that's plain SQL). Changing this
+#                     needs a restart.
 #        Default:     1
 #
 
 Weather.Enable = 1
 
 #
-#    Weather.ShowLightWeather
-#        Description: Show the light weather the core rolls. Stock AzerothCore sends most light
-#                     rain, snow and sandstorms to the client as clear skies, so a zone can be
-#                     "raining" for a long time with nothing on screen. On, that weather is drawn
-#                     as light, so weather shows up about as often as the `game_weather` chances
-#                     say.
-#        Default:     1
+#    Weather.FrontInterval
+#        Description: Once a region's dry spell is over, how often, in minutes, it rolls for a
+#                     new front. The chance is the region's wettest zone's `game_weather` chance
+#                     for the season. Minimum 1.
+#        Default:     10
 #
 
-Weather.ShowLightWeather = 1
+Weather.FrontInterval = 10
+
+#
+#    Weather.BuildUpMin, Weather.BuildUpMax
+#    Weather.PeakMin,    Weather.PeakMax
+#    Weather.TaperMin,   Weather.TaperMax
+#    Weather.DryMin,     Weather.DryMax
+#        Description: How long, in minutes, each part of a front lasts: a random time between
+#                     Min and Max. A front builds up from nothing, holds its peak (drifting a
+#                     little, like gusts), tapers off, then the region stays dry for at least the
+#                     dry spell before it can roll again.
+#        Default:     3, 6, 10, 25, 5, 8, 20, 60
+#
+
+Weather.BuildUpMin = 3
+Weather.BuildUpMax = 6
+Weather.PeakMin    = 10
+Weather.PeakMax    = 25
+Weather.TaperMin   = 5
+Weather.TaperMax   = 8
+Weather.DryMin     = 20
+Weather.DryMax     = 60
+
+#
+#    Weather.MediumChance, Weather.HeavyChance
+#        Description: Percent of fronts that peak at medium and at heavy. The rest stay light.
+#                     Thunderstorms only happen at heavy.
+#        Default:     30, 10
+#
+
+Weather.MediumChance = 30
+Weather.HeavyChance  = 10
+
+#
+#    Weather.FaintGrade
+#        Description: The faintest weather the module draws, from 0.01 to 0.27. The core sends
+#                     anything under 0.27 as clear skies; the module sends it as light weather
+#                     so fronts start and end with a drizzle instead of popping in at 0.27. If
+#                     the client draws nothing that faint, raise this. Continents only: zones
+#                     inside instances go through the core and start at 0.27.
+#        Default:     0.10
+#
+
+Weather.FaintGrade = 0.10
 
 #
 #    Weather.Fog
@@ -45,7 +88,7 @@ Weather.Fog = 1
 #
 #    Weather.FogInterval
 #        Description: How often, in seconds, a clear zone rolls its `fog_chance`. The fog (or
-#                     clear sky) lasts until the next roll or the next weather change.
+#                     clear sky) lasts until the next roll, or until a front arrives.
 #                     Minimum 60.
 #        Default:     600
 #
@@ -53,8 +96,18 @@ Weather.Fog = 1
 Weather.FogInterval = 600
 
 #
+#    Weather.MistAfterRain
+#        Description: When a front ends in a zone with a `fog_chance`, mist can settle for a few
+#                     minutes, at twice the zone's fog chance. Needs Weather.Fog.
+#        Default:     1
+#
+
+Weather.MistAfterRain = 1
+
+#
 #    Weather.Thunderstorms
-#        Description: Let heavy rain become a thunderstorm in zones with a `thunder_chance`.
+#        Description: Let heavy rain become a thunderstorm in zones with a `thunder_chance`. Each
+#                     front rolls it once per zone; the thunder comes while the rain is heavy.
 #        Default:     1
 #
 
