@@ -465,7 +465,10 @@ namespace
     // GRADE_STEP and each instance only sends when its own weather changes.
     void SendToInstance(Weather* weather, ZoneState& zoneState, WeatherState state, float grade)
     {
-        float const rounded = state != WEATHER_STATE_FINE ? std::round(grade / GRADE_STEP) * GRADE_STEP : 0.0f;
+        // Capped like the core caps it, or a heavy front rounds to 1.0, the core stores 0.9999 and
+        // every tick looks like a change.
+        float const rounded = state != WEATHER_STATE_FINE
+            ? std::min(std::round(grade / GRADE_STEP) * GRADE_STEP, GRADE_MAX) : 0.0f;
 
         applying = true;
         weather->SetWeather(TypeFor(state), rounded);
