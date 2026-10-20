@@ -26,17 +26,27 @@
  * ChangeWeatherInterval. The one zone a core script drives itself, Isle of Quel'Danas (the
  * Sunwell event), keeps the core's rolls on the original interval.
  *
+ * Overcast skies: the client never changes its sky for weather. With a client patch that holds
+ * the rows of `mod_weather_overcast`, the module lays a grey light over a player's sky while their
+ * zone has weather (SMSG_OVERRIDE_LIGHT): a palette for the kind of weather, at a weight for how
+ * heavy it is, switched a step at a time and faded by the client. Continents only. When
+ * mod-night-brightness is in the same server, it keeps the client's list of light swaps and the
+ * overcast goes through it, at the player's night brightness.
+ *
  * Released under GNU GPL v2 or (at your option) any later version.
  */
 
 #include "Chat.h"
 #include "Config.h"
 #include "DBCStores.h"
+#include "DataMap.h"
 #include "DatabaseEnv.h"
+#include "GameTime.h"
 #include "Log.h"
 #include "Map.h"
 #include "MapMgr.h"
 #include "MiscPackets.h"
+#include "Opcodes.h"
 #include "Player.h"
 #include "Random.h"
 #include "ScriptMgr.h"
@@ -44,14 +54,27 @@
 #include "Weather.h"
 #include "WeatherMgr.h"
 #include "World.h"
+#include "WorldPacket.h"
+#include "WorldSession.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
 
 using namespace Acore::ChatCommands;
+
+// mod-night-brightness, when it is built into the same server: it keeps the client's list of
+// light swaps, so the overcast goes through it (see its NightBrightness.cpp). Weak, so this module
+// links without it; compilers without weak symbols send the overcast themselves. Both modules
+// have to be in the same binary (the default static module build).
+#if defined(__GNUC__) || defined(__clang__)
+#define MOD_WEATHER_NIGHT_BRIGHTNESS 1
+extern "C" bool NightBrightness_SetOverlay(Player* player, uint32 count, uint32 const* areaLights,
+    uint32 const* lights, uint32 fadeMs) __attribute__((weak));
+#endif
 
 namespace
 {
@@ -83,6 +106,35 @@ namespace
     // Long enough that the core never rolls again (a week).
     constexpr uint32 CORE_INTERVAL_OFF = 7 * DAY * IN_MILLISECONDS;
 
+    // Overcast skies. The night brightness levels the rows come in (mod-night-brightness); 3 is
+    // the realm's own night, the one used without that module.
+    constexpr uint8 NIGHT_LEVEL_MAX = 5;
+    constexpr uint8 NIGHT_LEVEL_OWN = 3;
+
+    // How often each player's sky is brought up to date.
+    constexpr uint32 SKY_UPDATE = IN_MILLISECONDS;
+
+    // A step of the overcast fades over the time the weather takes to get there, within these.
+    constexpr uint32 SKY_FADE_MIN = 3 * IN_MILLISECONDS;
+    constexpr uint32 SKY_FADE_MAX = 20 * IN_MILLISECONDS;
+
+    // Another kind of weather, or into another zone.
+    constexpr uint32 SKY_CHANGE_FADE = 10 * IN_MILLISECONDS;
+
+    // When a client loads a map: it is behind a loading screen. Not 0, the client divides by it.
+    constexpr uint32 SKY_ENTER_FADE = 1;
+
+    // After a swap is taken away, how long past its fade to wait before the next change: the fade
+    // runs on the client's clock.
+    constexpr Milliseconds SKY_MARGIN = 3s;
+
+    // The weight moves a step only once it is this share of a step past it, so gusts don't flicker.
+    constexpr float SKY_HYSTERESIS = 0.6f;
+
+    // One kind of weather has to last this long before the overcast takes the other palette
+    // (heavy rain and thunder trade places as a storm's peak gusts around).
+    constexpr uint32 SKY_PALETTE_HOLD = 30 * IN_MILLISECONDS;
+
     struct Range
     {
         uint32 min = 0;
@@ -108,6 +160,9 @@ namespace
         bool thunderstorms = true;
         bool blackRain = true;
         bool blackSnow = true;
+        bool overcast = false;
+        float overcastLight = 0.15f;
+        float overcastHeavy = 0.80f;
 
         // ChangeWeatherInterval from worldserver.conf, before the module stretched it.
         uint32 coreInterval = 10 * MINUTE * IN_MILLISECONDS;
@@ -124,6 +179,39 @@ namespace
         Sand,
         Fog,
     };
+
+    // The colours of an overcast sky (`mod_weather_overcast.palette`).
+    enum Palette : uint8
+    {
+        PALETTE_NONE,
+        PALETTE_RAIN,
+        PALETTE_STORM, // thunder, black rain, black snow
+        PALETTE_SNOW,
+        PALETTE_SAND,
+        PALETTE_COUNT
+    };
+
+    // An overcast sky: a palette at one of its steps (index into skySteps[palette]).
+    struct Sky
+    {
+        uint8 palette = PALETTE_NONE;
+        uint8 step = 0;
+
+        bool operator==(Sky const& other) const { return palette == other.palette && step == other.step; }
+        bool operator!=(Sky const& other) const { return !(*this == other); }
+    };
+
+    // One weight of a palette: the Light rows to swap at each night brightness level.
+    struct SkyStep
+    {
+        float weight = 0.0f;
+        std::array<uint32, NIGHT_LEVEL_MAX + 1> areaLights {};
+        std::array<uint32, NIGHT_LEVEL_MAX + 1> lights {};
+    };
+
+    // By palette, lightest first. Filled once at startup.
+    std::array<std::vector<SkyStep>, PALETTE_COUNT> skySteps;
+    bool skyLoaded = false;
 
     enum class Phase : uint8
     {
@@ -187,6 +275,14 @@ namespace
 
         // Isle of Quel'Danas only: time toward the core's next roll.
         uint32 stockTimer = 0;
+
+        // The overcast players in the zone should have, and how long its last step should fade.
+        Sky sky;
+        uint32 skyFade = SKY_FADE_MAX;
+        float skyWeight = 0.0f; // the weight the weather asks for
+        float skyRate = 0.0f;   // how fast that moves, per second (smoothed)
+        uint8 skyNext = PALETTE_NONE; // another palette the weather has asked for, since skyNextFor ms
+        uint32 skyNextFor = 0;
     };
 
     std::mutex lock;
@@ -433,6 +529,105 @@ namespace
         }
     }
 
+    Palette PaletteFor(WeatherState state)
+    {
+        switch (state)
+        {
+            case WEATHER_STATE_LIGHT_RAIN:
+            case WEATHER_STATE_MEDIUM_RAIN:
+            case WEATHER_STATE_HEAVY_RAIN:
+                return PALETTE_RAIN;
+            case WEATHER_STATE_THUNDERS:
+            case WEATHER_STATE_BLACKRAIN:
+            case WEATHER_STATE_BLACKSNOW:
+                return PALETTE_STORM;
+            case WEATHER_STATE_LIGHT_SNOW:
+            case WEATHER_STATE_MEDIUM_SNOW:
+            case WEATHER_STATE_HEAVY_SNOW:
+                return PALETTE_SNOW;
+            case WEATHER_STATE_LIGHT_SANDSTORM:
+            case WEATHER_STATE_MEDIUM_SANDSTORM:
+            case WEATHER_STATE_HEAVY_SANDSTORM:
+                return PALETTE_SAND;
+            default:
+                return PALETTE_NONE; // clear, fog
+        }
+    }
+
+    // The step of a palette nearest a weight.
+    uint8 NearestStep(std::vector<SkyStep> const& steps, float weight)
+    {
+        uint8 best = 0;
+        for (uint8 i = 1; i < steps.size(); ++i)
+            if (std::fabs(steps[i].weight - weight) < std::fabs(steps[best].weight - weight))
+                best = i;
+        return best;
+    }
+
+    // Brings a continent zone's overcast up to date with what it shows. Call with the lock held.
+    void UpdateSky(ZoneState& zoneState, WeatherState state, uint32 diff)
+    {
+        Palette const palette = config.overcast ? PaletteFor(state) : PALETTE_NONE;
+        std::vector<SkyStep> const& steps = skySteps[palette];
+
+        // From the faintest weather drawn to the heaviest.
+        float weight = 0.0f;
+        if (palette != PALETTE_NONE && !steps.empty())
+            weight = config.overcastLight + (config.overcastHeavy - config.overcastLight)
+                * std::clamp((zoneState.grade - config.faintGrade) / (1.0f - config.faintGrade), 0.0f, 1.0f);
+
+        if (diff)
+        {
+            float const speed = std::fabs(weight - zoneState.skyWeight) * IN_MILLISECONDS / diff;
+            zoneState.skyRate += (speed - zoneState.skyRate) * std::min(1.0f, diff / 10000.0f);
+        }
+        zoneState.skyWeight = weight;
+
+        if (palette == PALETTE_NONE || steps.empty())
+        {
+            if (zoneState.sky.palette != PALETTE_NONE)
+            {
+                zoneState.sky = Sky();
+                zoneState.skyFade = SKY_CHANGE_FADE;
+            }
+            return;
+        }
+
+        uint8 const nearest = NearestStep(steps, weight);
+        if (zoneState.sky.palette != palette)
+        {
+            // From clear skies at once; from another palette once the new one has lasted.
+            if (zoneState.sky.palette != PALETTE_NONE)
+            {
+                if (zoneState.skyNext != palette)
+                {
+                    zoneState.skyNext = palette;
+                    zoneState.skyNextFor = 0;
+                }
+                zoneState.skyNextFor += diff;
+                if (zoneState.skyNextFor < SKY_PALETTE_HOLD)
+                    return;
+            }
+
+            zoneState.sky = { uint8(palette), nearest };
+            zoneState.skyFade = SKY_CHANGE_FADE;
+            zoneState.skyNext = PALETTE_NONE;
+            return;
+        }
+        zoneState.skyNext = PALETTE_NONE;
+
+        // Move when the weight is well past the step it is on (steps are `gap` apart).
+        float const gap = steps.size() > 1 ? (steps.back().weight - steps.front().weight) / (steps.size() - 1) : 1.0f;
+        float const from = steps[zoneState.sky.step].weight;
+        if (nearest == zoneState.sky.step || std::fabs(weight - from) < gap * SKY_HYSTERESIS)
+            return;
+
+        // Fade over the time the weather takes to cover the same distance.
+        float const seconds = std::fabs(steps[nearest].weight - from) / std::max(zoneState.skyRate, 0.0001f);
+        zoneState.skyFade = std::clamp<uint32>(uint32(std::min(seconds, 3600.0f) * IN_MILLISECONDS), SKY_FADE_MIN, SKY_FADE_MAX);
+        zoneState.sky.step = nearest;
+    }
+
     // Sends what a zone on a continent shows. Call with the lock held, on the thread of the
     // zone's map.
     void Send(Weather* weather, Map* map, ZoneState& zoneState, WeatherState state, float grade)
@@ -619,6 +814,9 @@ namespace
 
         WeatherState const state = StateFor(zoneState, rule);
         float const grade = state != WEATHER_STATE_FINE ? zoneState.grade : 0.0f;
+        if (zoneState.continent)
+            UpdateSky(zoneState, state, diff);
+
         if (!map)
         {
             SendToInstance(weather, zoneState, state, grade);
@@ -771,6 +969,190 @@ namespace
         AreaTableEntry const* area = sAreaTableStore.LookupEntry(zone);
         return area ? area->area_name[handler->GetSessionDbcLocale()] : "?";
     }
+
+    char const* PaletteName(uint8 palette)
+    {
+        switch (palette)
+        {
+            case PALETTE_RAIN:  return "rain";
+            case PALETTE_STORM: return "storm";
+            case PALETTE_SNOW:  return "snow";
+            case PALETTE_SAND:  return "sand";
+            default:            return "none";
+        }
+    }
+
+    uint32 LoadSky()
+    {
+        // (palette, step) -> rows; steps are numbered from 1, lightest first
+        std::array<std::vector<SkyStep>, PALETTE_COUNT> loaded;
+        uint32 rows = 0;
+        if (QueryResult result = WorldDatabase.Query(
+            "SELECT `palette`, `step`, `level`, `weight`, `area_light`, `light` FROM `mod_weather_overcast` ORDER BY `palette`, `step`"))
+        {
+            do
+            {
+                Field* fields = result->Fetch();
+                uint8 const palette = fields[0].Get<uint8>();
+                uint8 const step = fields[1].Get<uint8>();
+                uint8 const level = fields[2].Get<uint8>();
+                if (palette == PALETTE_NONE || palette >= PALETTE_COUNT || !step || !level || level > NIGHT_LEVEL_MAX)
+                    continue;
+
+                std::vector<SkyStep>& steps = loaded[palette];
+                if (steps.size() < step)
+                    steps.resize(step);
+
+                SkyStep& entry = steps[step - 1];
+                entry.weight = fields[3].Get<float>();
+                entry.areaLights[level] = fields[4].Get<uint32>();
+                entry.lights[level] = fields[5].Get<uint32>();
+                ++rows;
+            } while (result->NextRow());
+        }
+
+        // Every step has to have the realm's own night, the one used without mod-night-brightness.
+        for (uint8 palette = PALETTE_RAIN; palette < PALETTE_COUNT; ++palette)
+        {
+            std::vector<SkyStep>& steps = loaded[palette];
+            steps.erase(std::remove_if(steps.begin(), steps.end(), [](SkyStep const& step)
+            {
+                return !step.areaLights[NIGHT_LEVEL_OWN] || !step.lights[NIGHT_LEVEL_OWN];
+            }), steps.end());
+            std::sort(steps.begin(), steps.end(), [](SkyStep const& a, SkyStep const& b) { return a.weight < b.weight; });
+            skySteps[palette] = std::move(steps);
+        }
+
+        skyLoaded = std::any_of(skySteps.begin(), skySteps.end(), [](std::vector<SkyStep> const& steps) { return !steps.empty(); });
+        return rows;
+    }
+
+    struct Swap
+    {
+        uint32 areaLight = 0;
+        uint32 light = 0;
+
+        bool operator==(Swap const& other) const { return areaLight == other.areaLight && light == other.light; }
+    };
+
+    // What a player's client has been sent. Lives on the Player and is only touched by the thread
+    // that updates the player.
+    class ClientSky : public DataMap::Base
+    {
+    public:
+        uint32 timer = 0;
+        bool entered = true;      // the client has just loaded a map
+        Sky sent;                 // the overcast last handed over
+        uint32 sentZone = 0;      // the zone it was for
+        bool tested = false;      // .weather sky: shown to this player alone until they change zone
+        Sky test;
+        uint32 testZone = 0;
+
+        // Without mod-night-brightness: the swap on the client, and when it may be changed again.
+        Swap onClient;
+        Milliseconds nextChange = 0ms;
+    };
+
+    constexpr char const* CLIENT_SKY_KEY = "mod-weather-sky";
+
+    void SendSwap(Player* player, uint32 areaLight, uint32 light, uint32 fade)
+    {
+        WorldPacket data(SMSG_OVERRIDE_LIGHT, 4 + 4 + 4);
+        data << uint32(areaLight);
+        data << uint32(light); // 0 takes the swap for areaLight away again
+        data << uint32(fade);
+        player->SendDirectMessage(&data);
+    }
+
+    // Without mod-night-brightness the overcast is the only swap this module sends, so the
+    // client's list holds at most this one (and the one fading out). A swap that is taken away is
+    // dropped once it has faded, by moving the last swap of the list into its place, and the
+    // client finds the swap to drop by its area row, first one first: so one change at a time.
+    bool SendOwnSky(Player* player, ClientSky* client, Swap const& want, uint32 fade)
+    {
+        Swap& have = client->onClient;
+        if (have == want)
+            return true;
+
+        Milliseconds const now = GameTime::GetGameTimeMS();
+        if (now < client->nextChange)
+            return false;
+
+        // A swap on the same area row replaces the old one by itself.
+        if (have.light && (!want.light || have.areaLight != want.areaLight))
+            SendSwap(player, have.areaLight, 0, fade);
+        if (want.light)
+            SendSwap(player, want.areaLight, want.light, fade);
+        if (have.light)
+            client->nextChange = now + Milliseconds(fade) + SKY_MARGIN;
+        have = want;
+        return true;
+    }
+
+    // Hands an overcast to the client. False if it is still busy with the last change.
+    bool ShowSky(Player* player, ClientSky* client, Sky const& sky, uint32 fade)
+    {
+        std::array<uint32, NIGHT_LEVEL_MAX + 1> areaLights {};
+        std::array<uint32, NIGHT_LEVEL_MAX + 1> lights {};
+        if (sky.palette != PALETTE_NONE && sky.step < skySteps[sky.palette].size())
+        {
+            SkyStep const& step = skySteps[sky.palette][sky.step];
+            areaLights = step.areaLights;
+            lights = step.lights;
+        }
+
+#ifdef MOD_WEATHER_NIGHT_BRIGHTNESS
+        if (NightBrightness_SetOverlay)
+            return NightBrightness_SetOverlay(player, uint32(areaLights.size()), areaLights.data(), lights.data(), fade);
+#endif
+
+        return SendOwnSky(player, client, { areaLights[NIGHT_LEVEL_OWN], lights[NIGHT_LEVEL_OWN] }, fade);
+    }
+
+    // Once a second for each player with a client: the overcast of the zone they are in.
+    void UpdateClientSky(Player* player, ClientSky* client)
+    {
+        uint32 const zone = player->GetZoneId();
+        if (!zone)
+            return;
+
+        if (client->tested && client->testZone != zone)
+            client->tested = false;
+
+        Sky want;
+        uint32 fade = SKY_CHANGE_FADE;
+        if (client->tested)
+            want = client->test;
+        else
+        {
+            std::lock_guard<std::mutex> guard(lock);
+            auto itr = zones.find(zone);
+            if (itr != zones.end() && itr->second.continent)
+            {
+                want = itr->second.sky;
+                fade = itr->second.skyFade;
+            }
+        }
+
+        bool const entered = client->entered;
+        client->entered = false;
+        if (want == client->sent)
+        {
+            client->sentZone = zone;
+            return;
+        }
+
+        if (entered)
+            fade = SKY_ENTER_FADE;
+        else if (zone != client->sentZone)
+            fade = SKY_CHANGE_FADE;
+
+        if (ShowSky(player, client, want, fade))
+        {
+            client->sent = want;
+            client->sentZone = zone;
+        }
+    }
 }
 
 class ModWeatherScript : public WeatherScript
@@ -790,6 +1172,45 @@ public:
     {
         if (config.enabled)
             ZoneTick(weather, false);
+    }
+};
+
+class ModWeatherPlayerScript : public PlayerScript
+{
+public:
+    ModWeatherPlayerScript() : PlayerScript("ModWeatherPlayerScript",
+        { PLAYERHOOK_ON_SEND_INITIAL_PACKETS_BEFORE_ADD_TO_MAP, PLAYERHOOK_ON_UPDATE }) { }
+
+    // The client forgets its light swaps with the map it leaves, so each map starts over.
+    void OnPlayerSendInitialPacketsBeforeAddToMap(Player* player, WorldPacket& /*data*/) override
+    {
+        if (player->GetSession()->IsSocketClosed())
+            return;
+
+        // The first update comes at once, while the client is still behind its loading screen.
+        ClientSky* client = player->CustomData.GetDefault<ClientSky>(CLIENT_SKY_KEY);
+        client->timer = SKY_UPDATE;
+        client->entered = true;
+        client->sent = Sky();
+        client->sentZone = 0;
+        client->tested = false;
+        client->onClient = Swap();
+        client->nextChange = 0ms;
+    }
+
+    void OnPlayerUpdate(Player* player, uint32 diff) override
+    {
+        // Bots and players whose connection is gone have no client to draw a sky.
+        if (!config.enabled || !skyLoaded || player->GetSession()->IsSocketClosed())
+            return;
+
+        ClientSky* client = player->CustomData.GetDefault<ClientSky>(CLIENT_SKY_KEY);
+        client->timer += diff;
+        if (client->timer < SKY_UPDATE)
+            return;
+
+        client->timer = 0;
+        UpdateClientSky(player, client);
     }
 };
 
@@ -820,6 +1241,9 @@ public:
         config.thunderstorms = sConfigMgr->GetOption<bool>("Weather.Thunderstorms", true);
         config.blackRain     = sConfigMgr->GetOption<bool>("Weather.BlackRain", true);
         config.blackSnow     = sConfigMgr->GetOption<bool>("Weather.BlackSnow", true);
+        config.overcast      = sConfigMgr->GetOption<bool>("Weather.Overcast", false);
+        config.overcastLight = std::clamp(sConfigMgr->GetOption<float>("Weather.OvercastLight", 0.15f), 0.0f, 1.0f);
+        config.overcastHeavy = std::clamp(sConfigMgr->GetOption<float>("Weather.OvercastHeavy", 0.80f), config.overcastLight, 1.0f);
 
         if (config.fogInterval < MINUTE * IN_MILLISECONDS)
             config.fogInterval = MINUTE * IN_MILLISECONDS;
@@ -840,6 +1264,24 @@ public:
 
         if (!WeatherMgr::GetWeatherData(3537)) // Borean Tundra, one of the zones the SQL adds
             LOG_ERROR("module", "mod-weather: `game_weather` has no row for Borean Tundra. Apply the module's SQL.");
+
+        uint32 const skyRows = LoadSky();
+        uint32 steps = 0;
+        for (std::vector<SkyStep> const& palette : skySteps)
+            steps += palette.size();
+        if (!config.overcast)
+            LOG_INFO("module", "mod-weather: overcast skies off.");
+        else if (steps)
+        {
+            char const* through = "";
+#ifdef MOD_WEATHER_NIGHT_BRIGHTNESS
+            if (NightBrightness_SetOverlay)
+                through = ", through mod-night-brightness";
+#endif
+            LOG_INFO("module", "mod-weather: overcast skies: {} steps in {} rows{}.", steps, skyRows, through);
+        }
+        else
+            LOG_WARN("module", "mod-weather: `mod_weather_overcast` is empty: no overcast skies.");
     }
 
     void OnUpdate(uint32 diff) override
@@ -862,6 +1304,7 @@ public:
             { "start",  HandleStartCommand,  SEC_GAMEMASTER,    Console::No  },
             { "stop",   HandleStopCommand,   SEC_GAMEMASTER,    Console::No  },
             { "show",   HandleShowCommand,   SEC_GAMEMASTER,    Console::No  },
+            { "sky",    HandleSkyCommand,    SEC_GAMEMASTER,    Console::No  },
             { "reload", HandleReloadCommand, SEC_ADMINISTRATOR, Console::Yes },
         };
 
@@ -946,6 +1389,13 @@ public:
 
         handler->PSendSysMessage("Showing {} at {:.2f} (sent: {} at {:.2f}){}.", KindName(zoneState.kind), zoneState.grade,
             StateName(zoneState.sentState), zoneState.sentGrade, zoneState.continent ? "" : ", inside an instance");
+
+        if (zoneState.sky.palette != PALETTE_NONE && zoneState.sky.step < skySteps[zoneState.sky.palette].size())
+            handler->PSendSysMessage("Overcast: {} at {:.2f} (wanted {:.2f}), last step faded over {} s.",
+                PaletteName(zoneState.sky.palette), skySteps[zoneState.sky.palette][zoneState.sky.step].weight,
+                zoneState.skyWeight, zoneState.skyFade / IN_MILLISECONDS);
+        else if (zoneState.continent)
+            handler->PSendSysMessage("Overcast: none{}.", config.overcast ? "" : " (Weather.Overcast is off)");
         return true;
     }
 
@@ -1013,6 +1463,46 @@ public:
         return true;
     }
 
+    // Shows an overcast to you alone, to see how the client draws it: a palette at the step nearest
+    // a weight. It lasts until you change zones or use .weather sky off.
+    static bool HandleSkyCommand(ChatHandler* handler, std::string palette, Optional<float> weight)
+    {
+        Player* player = handler->GetPlayer();
+        ClientSky* client = player->CustomData.GetDefault<ClientSky>(CLIENT_SKY_KEY);
+        if (palette == "off")
+        {
+            client->tested = false;
+            handler->SendSysMessage("Your sky follows the weather again.");
+            return true;
+        }
+
+        uint8 which = PALETTE_NONE;
+        for (uint8 i = PALETTE_RAIN; i < PALETTE_COUNT; ++i)
+            if (palette == PaletteName(i))
+                which = i;
+
+        if (which == PALETTE_NONE)
+        {
+            handler->SendSysMessage("Usage: .weather sky rain|storm|snow|sand [weight 0-1], or .weather sky off");
+            return true;
+        }
+
+        std::vector<SkyStep> const& steps = skySteps[which];
+        if (steps.empty())
+        {
+            handler->SendSysMessage("No overcast rows are loaded (`mod_weather_overcast`).");
+            return true;
+        }
+
+        uint8 const step = NearestStep(steps, std::clamp(weight.value_or(0.6f), 0.0f, 1.0f));
+        client->tested = true;
+        client->test = { which, step };
+        client->testZone = player->GetZoneId();
+        handler->PSendSysMessage("Showing a {} overcast at {:.2f} to you only, from the next second, until you change zones "
+            "or use .weather sky off.", PaletteName(which), steps[step].weight);
+        return true;
+    }
+
     static bool HandleReloadCommand(ChatHandler* handler)
     {
         uint32 const zoneCount = LoadRules();
@@ -1025,6 +1515,7 @@ public:
 void AddModWeatherScripts()
 {
     new ModWeatherScript();
+    new ModWeatherPlayerScript();
     new ModWeatherWorldScript();
     new ModWeatherCommandScript();
 }

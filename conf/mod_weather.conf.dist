@@ -129,3 +129,30 @@ Weather.BlackRain = 1
 #
 
 Weather.BlackSnow = 1
+
+#
+#    Weather.Overcast
+#        Description: Grey the sky while a zone has rain, snow or a sandstorm: a light laid over
+#                     the player's own lighting, darker the heavier the weather (thunderstorms,
+#                     black rain and black snow darkest), faded in and out a step at a time.
+#                     Continents only. Needs a client patch with the rows of
+#                     `mod_weather_overcast`, which belong to one patch (see the README): turn it
+#                     on only when your players have that patch. With mod-night-brightness in
+#                     the same server the overcast goes through it and follows each player's
+#                     night brightness.
+#        Default:     0
+#
+
+Weather.Overcast = 0
+
+#
+#    Weather.OvercastLight, Weather.OvercastHeavy
+#        Description: How far the sky is pulled toward the overcast's colours, from 0 (not at
+#                     all) to 1 (all the way): at the faintest weather drawn (Weather.FaintGrade)
+#                     and at the heaviest. In between it follows the weather's strength. The
+#                     client patch has steps from 0.05 to 0.90.
+#        Default:     0.15, 0.80
+#
+
+Weather.OvercastLight = 0.15
+Weather.OvercastHeavy = 0.80
