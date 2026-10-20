@@ -92,6 +92,11 @@ so.
 
 Make sure `ActivateWeather = 1` in `worldserver.conf` (it's the default).
 
+To remove the module, take it out of `modules`, rebuild, and run
+`data/sql/uninstall/mod_weather_uninstall_world.sql` on the world database. It drops the module's
+tables, removes the zones it added to `game_weather` and gives the other zones back to the core's
+own weather.
+
 ## Overcast skies
 
 Weather in 3.3.5a is only what falls: the sky, the sun and the fog stay as they are. (The client
@@ -123,17 +128,53 @@ four lighting tables plus these rows, and the table `mod_weather_overcast`
 file come from the same build.** The rows in this repository were built for one client with
 lighting patches of its own; a client without that patch ignores the swaps and sees no
 overcast, but a client with other custom lighting rows under the same IDs would get them, so
-`Weather.Overcast` is off by default: turn it on when your players have the patch the rows came
-from. A builder for other clients is not part of this repository yet. With `Weather.Overcast` on
-and no rows in the table, the worldserver logs a warning and the rest of the module runs as
-before.
+`Weather.Overcast` is off by default: build the patch and the SQL for your players' client (below)
+and turn it on once they have the patch. With `Weather.Overcast` on and no rows in the table, the
+worldserver logs a warning and the rest of the module runs as before.
+
+### Building the client patch
+
+`tools/build_overcast.py` builds both from your players' client. It needs Python 3 and
+[StormLib](https://github.com/ladislav-zezula/StormLib) (`STORMLIB` names the library, default
+`/usr/local/lib/libstorm.dylib`).
+
+```bash
+python3 tools/build_overcast.py --client /path/to/client --out patch-Z.MPQ \
+    --sql data/sql/db-world/mod_weather_overcast.sql
+```
+
+- `--client` is the 3.3.5a client folder your players have (with `Data/` and `Data/enUS/`;
+  `--locale` for another language). The four lighting tables (`Light`, `LightParams`,
+  `LightIntBand`, `LightFloatBand`) are read from the last archive the client loads that has
+  each.
+- `--patch` adds a patch your players get on top of that client, such as your own lighting patch
+  or mod-night-brightness's. Repeat it, in load order. Leave the overcast patch itself out, in
+  `--patch` and in the client folder: a build on top of an old one stops.
+- `--out` is the patch: the four tables with the overcast rows added at the end (18 weights and 4
+  palettes, on a map that doesn't exist, with IDs above the highest the tables have). It replaces
+  every other patch's lighting tables, so it has to load after all of them: give it a name that
+  sorts after theirs. A stock `Wow.exe` only loads patches with a one-character name
+  (`patch-Z.MPQ` sorts after the other letters and the digits); a longer name such as
+  `patch-z99-overcast.MPQ` needs a client that loads those. The builder reads every `patch-*.MPQ`
+  in `Data/`, so take out any your client doesn't load. Build it again whenever one of them
+  changes, after them.
+- `--sql` writes `mod_weather_overcast` for that patch. Point it at your server's copy of the
+  module (it replaces the rows that came with the repository) and restart the server: the
+  updater applies the file again. Keep your copy when you update the module, or build again.
+
+The palettes are the same for every client; their night is your client's. The builder measures
+how much darker each colour gets by night on the continents (as a share of noon, every 90
+minutes) and darkens the palettes on that clock, the sky and clouds a little further, so an
+overcast night is as dark as the night under it. It prints your client's typical colours and
+night, and the rows it added.
 
 **With [mod-night-brightness](https://github.com/buildthehomelab/wow-mod-night-brightness).** That
 module sends light swaps too, and the client keeps one list for both, in which order matters.
 When both modules are in the server (GCC or Clang), the overcast goes through mod-night-brightness,
 which keeps the list: the overcast lies above the player's night brightness level, on rows made
 for that level, so an overcast night is as bright as the player picked. `mod_weather_overcast`
-has rows for each night level (`level`; 3 is the realm's own night). The two modules find each
+has rows for each night level (`level`; 3 is the client's own night). `tools/build_overcast.py`
+builds level 3 only: players at another level see no overcast. The two modules find each
 other only in the same binary, the default static module build: on MSVC or with
 `MODULES=dynamic` they don't, so use one of them there. A `.night` change asked for while the sky
 is changing goes before the next overcast step.
