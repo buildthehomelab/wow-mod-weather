@@ -195,6 +195,7 @@ thunderstorms, black rain and black snow off on their own.
 | `.weather sky rain\|storm\|snow\|sand [weight]` | Shows an overcast to you only, at the step nearest the weight (0 to 1, default 0.6), until you change zones. `.weather sky off` ends it. Needs the client patch. |
 | `.weather show <state> [grade]` | Shows a weather state to you only, to check how the client draws it. The grade (0 to 1, default 0.9) is the strength. Lasts until the zone's weather next changes (every few seconds during a front) or you leave. |
 | `.weather reload` | Reloads `mod_weather_zone` and `mod_weather_region`. |
+| `.server time [HH:MM\|reset]` | Moves your client's clock only, to check the lighting, sky and fog of another hour. It keeps counting from there and lasts until you relog or change map; `reset` puts the real time back. With no time, shows the server's. |
 
 States for `.weather show`: `0` clear, `1` fog, `3`/`4`/`5` light/medium/heavy rain,
 `6`/`7`/`8` light/medium/heavy snow, `22`/`41`/`42` light/medium/heavy sandstorm, `86`
