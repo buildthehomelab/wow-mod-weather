@@ -60,6 +60,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <ctime>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -1308,12 +1310,62 @@ public:
             { "reload", HandleReloadCommand, SEC_ADMINISTRATOR, Console::Yes },
         };
 
+        static ChatCommandTable serverCommands =
+        {
+            { "time", HandleServerTimeCommand, SEC_GAMEMASTER, Console::No },
+        };
+
         static ChatCommandTable commandTable =
         {
             { "weather", subCommands },
+            { "server", serverCommands },
         };
 
         return commandTable;
+    }
+
+    // Moves your client's clock only, to see the lighting, sky and fog of another hour. The client
+    // keeps counting from there. A relog or a change of map puts the real time back.
+    static bool HandleServerTimeCommand(ChatHandler* handler, Optional<std::string> value)
+    {
+        time_t const now = GameTime::GetGameTime().count();
+        tm shown = Acore::Time::TimeBreakdown(now);
+        if (!value)
+        {
+            handler->PSendSysMessage("The server's time is {:02}:{:02}. Use .server time HH:MM to move your clock, "
+                ".server time reset to put it back.", shown.tm_hour, shown.tm_min);
+            return true;
+        }
+
+        time_t sent = now;
+        if (*value != "reset")
+        {
+            int hour = 0;
+            int minute = 0;
+            char extra = 0;
+            int const fields = std::sscanf(value->c_str(), "%d:%d%c", &hour, &minute, &extra);
+            if (fields < 1 || fields > 2 || hour < 0 || hour > 23 || minute < 0 || minute > 59)
+            {
+                handler->SendErrorMessage("Use .server time HH:MM (00:00 to 23:59) or .server time reset.");
+                return false;
+            }
+
+            shown.tm_hour = hour;
+            shown.tm_min = minute;
+            shown.tm_isdst = -1;
+            sent = std::mktime(&shown);
+        }
+
+        WorldPacket data(SMSG_LOGIN_SETTIMESPEED, 4 + 4 + 4);
+        data.AppendPackedTime(sent);
+        data << float(0.01666667f);
+        data << uint32(0);
+        handler->GetPlayer()->SendDirectMessage(&data);
+
+        tm const result = Acore::Time::TimeBreakdown(sent);
+        handler->PSendSysMessage("Your clock now shows {:02}:{:02}, to you only. It lasts until you relog or change map.",
+            result.tm_hour, result.tm_min);
+        return true;
     }
 
     // The region, its front, and what the zone you're standing in shows.
