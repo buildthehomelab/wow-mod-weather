@@ -82,8 +82,9 @@ cd azerothcore-wotlk/modules
 git clone https://github.com/buildthehomelab/wow-mod-weather.git mod-weather
 ```
 
-Clone into `mod-weather` exactly, because AzerothCore derives the loader symbol from the folder
-name. Then re-run CMake, rebuild, and copy `conf/mod_weather.conf.dist` to your config folder
+AzerothCore derives the loader symbol from the folder name. The module defines it for
+`mod-weather` and for `wow-mod-weather` (a plain `git clone`), so either works; any other folder
+name fails to link. Then re-run CMake, rebuild, and copy `conf/mod_weather.conf.dist` to your config folder
 as `mod_weather.conf`.
 
 The SQL in `data/sql/db-world/updates` adds the zones and the rules, and the worldserver's
@@ -223,8 +224,9 @@ Use `.weather start` and `.weather stop` instead.
 - **No new weather and the worldserver logs that `game_weather` has no row for Borean Tundra**:
   the module's SQL in `data/sql/db-world/updates` wasn't applied. Apply it, or let the
   worldserver's updater do it.
-- **The module builds but nothing changes**: the folder isn't named `mod-weather`, so
-  AzerothCore never calls the loader. Clone into `mod-weather` exactly.
+- **The worldserver fails to link with `undefined reference to 'Add<folder>Scripts()'`**: the
+  module's folder is named something other than `mod-weather` or `wow-mod-weather`. Rename it to
+  one of those and re-run CMake.
 - **Edits to `mod_weather_zone` or `mod_weather_region` don't show**: run `.weather reload`. New
   `game_weather` rows need a worldserver restart.
 - **Fronts start and end with a pop instead of a drizzle**: the client may not draw weather as
